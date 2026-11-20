@@ -39,4 +39,5 @@ def test_real_roundtrip(real_key):
         assert key["s"].data == "hi"
         assert key["child"].path.endswith("\\child")
     with RegKey("HKEY_CURRENT_USER") as root:
-        assert "Software" in list(root.enum_keys())
+        # Registry key names are case-insensitive; some images store "SOFTWARE".
+        assert "software" in [name.lower() for name in root.enum_keys()]
