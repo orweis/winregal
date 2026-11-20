@@ -39,7 +39,7 @@ def test_path_with_hive_name_case_insensitive():
 def test_bare_hive_opens_root():
     k = RegKey("HKEY_CURRENT_USER")
     assert k.path == "" and k.name == ""
-    assert repr(k) == "RegKey(HKEY_CURRENT_USER\\)"
+    assert repr(k) == "RegKey(HKEY_CURRENT_USER)"
 
 
 def test_explicit_hkey_strips_leading_separator():
@@ -91,6 +91,8 @@ def test_missing_key_raises_and_does_not_leak(tree):
     with pytest.raises(OSError):
         with RegKey("HKEY_CURRENT_USER\\Nope"):
             pass
+    assert not tree.open_handles
+    assert not tree.closed
 
 
 def test_double_enter_rejected_and_handle_kept(tree):

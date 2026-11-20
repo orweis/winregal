@@ -192,6 +192,8 @@ class RegKey:
         return self.get_sub_key(item)
 
     def __repr__(self) -> str:
+        if not self.path:
+            return f"RegKey({self.hkey_name})"
         return f"RegKey({self.hkey_name}\\{self.path})"
 
     def enum_keys(self) -> Iterator[str]:

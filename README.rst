@@ -105,11 +105,14 @@ Migrating from 1.x to 2.0
   key; previously it could escape to another key of the hive. ``/`` and ``:`` are ordinary
   name characters, as in the registry itself.
 - ``RegKey("HKEY_CURRENT_USER")`` (hive only) now works; ``RegKey(path, unknown_hkey)`` and
-  hive names that are not real hives raise ``UnknownHkeyException``.
-- ``to_dict(keep_type=True)`` now applies to nested keys too.
+  hive names that are not real hives raise ``UnknownHkeyException`` (an ``OSError``;
+  it was a ``KeyError`` for an unknown explicit hkey, so update ``except KeyError`` handlers).
+- ``to_dict(keep_type=True)`` now applies to nested keys too: values of nested keys are
+  ``RegValue`` objects instead of bare data.
 - Re-entering an already-open ``RegKey`` raises ``WinregalException``.
 - ``WinregalException`` derives from ``OSError`` instead of ``WindowsError`` (the same class on Windows).
-- ``RegValue.__repr__`` changed and ``RegValue`` now compares by value.
+- ``RegValue.__repr__`` changed and ``RegValue`` now compares by value and is therefore unhashable (no sets or dict keys).
+- ``repr(RegKey)`` no longer ends with a backslash for hive roots.
 
 Roadmap
 -------
