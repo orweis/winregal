@@ -1,199 +1,229 @@
+"""WinRegal: use the Windows Registry like a king.
+
+A modern, read-only Python wrapper around :mod:`winreg`.
 """
-WinRegal Use the Windows Registry like a king.
-:author: Or Weis 2016
-"""
-try:
-    # Try Python 2.7
-    import _winreg as winreg
-    number_type = long
-except ImportError:
-    # Try Python 3
-    import winreg
-    number_type = int
-    
-import os
+
+from __future__ import annotations
+
+import winreg
+from collections.abc import Iterator
+from typing import Any
+
+#: Windows error code signalling the end of an enumeration.
+ERROR_NO_MORE_ITEMS = 259
+#: Windows error code for "file (key or value) not found".
+ERROR_FILE_NOT_FOUND = 2
+
+_SEP = "\\"
 
 
-class RegValue(object):
-    def __init__(self, name, data, data_type):
-        """
-        Object representing a Registry value
-        :param name: the name of the value under its parent key
-        :param data: the actual content of the value
-        :param data_type: the registry value type (one of the winreg.REG_* values)
-        """
+def _hkey_map() -> dict[int, str]:
+    names = (
+        "HKEY_CURRENT_USER",
+        "HKEY_CLASSES_ROOT",
+        "HKEY_CURRENT_CONFIG",
+        "HKEY_DYN_DATA",
+        "HKEY_LOCAL_MACHINE",
+        "HKEY_PERFORMANCE_DATA",
+        "HKEY_USERS",
+    )
+    return {getattr(winreg, n): n for n in names if hasattr(winreg, n)}
+
+
+def _join(base: str, sub_path: str) -> str:
+    """Join registry path parts with backslashes only.
+
+    Unlike ``os.path.join`` a leading separator in ``sub_path`` never discards
+    ``base``, and ``/`` or ``:`` are ordinary characters (valid in key names).
+    """
+    parts = [p for p in (base.strip(_SEP), sub_path.strip(_SEP)) if p]
+    return _SEP.join(parts)
+
+
+def _is_not_found(exc: OSError) -> bool:
+    return getattr(exc, "winerror", None) == ERROR_FILE_NOT_FOUND or isinstance(
+        exc, FileNotFoundError
+    )
+
+
+class RegValue:
+    """A registry value.
+
+    :param name: the name of the value under its parent key
+    :param data: the actual content of the value
+    :param data_type: the registry value type (one of the ``winreg.REG_*`` values)
+    """
+
+    def __init__(self, name: str, data: Any, data_type: int) -> None:
         self.name = name
         self.data = data
         self.type = data_type
 
-    def __repr__(self):
-        return "RegValue(%s)" % self.__dict__
+    def __repr__(self) -> str:
+        return f"RegValue(name={self.name!r}, data={self.data!r}, type={self.type!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, RegValue):
+            return NotImplemented
+        return (self.name, self.data, self.type) == (other.name, other.data, other.type)
+
+    __hash__ = None  # type: ignore[assignment]  # mutable, compares by value
 
 
-class WinregalException(WindowsError):
-    pass
+class WinregalException(OSError):
+    """Base class of all WinRegal errors (``WindowsError`` on Windows is ``OSError``)."""
 
 
 class KeyNotOpenException(WinregalException):
-    """
-    Raised when trying to operate on a RegKey, outside of its 'with' block.
-    """
-    pass
+    """Raised when operating on a RegKey outside of its 'with' block."""
 
 
 class UnknownHkeyException(WinregalException):
-    pass
+    """Raised when a hive (HKEY_*) name or handle is not recognised."""
 
 
-class RegKey(object):
-    HKEY_MAP = {
-        winreg.HKEY_CURRENT_USER: "HKEY_CURRENT_USER",
-        winreg.HKEY_CLASSES_ROOT: "HKEY_CLASSES_ROOT",
-        winreg.HKEY_CURRENT_CONFIG: "HKEY_CURRENT_CONFIG",
-        winreg.HKEY_DYN_DATA: "HKEY_DYN_DATA",
-        winreg.HKEY_LOCAL_MACHINE: "HKEY_LOCAL_MACHINE",
-        winreg.HKEY_PERFORMANCE_DATA: "HKEY_PERFORMANCE_DATA",
-        winreg.HKEY_USERS: "HKEY_USERS",
-    }
+class RegKey:
+    r"""Read-only access to a Windows registry key.
 
-    def __init__(self, path, hkey=None, deep=False):
-        """
-        Access a Windows registry key path.
-        :param str path: The path to the key, may begin with one of HKEY_* strings (see RegKey.HKEY_MAP)
-                     in this case pass None for the optional hkey parameter.
-                     Example: "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-        :param number,None hkey: optional one of the RegKey.HEKEY_MAP.keys()
-        :param bool deep: should iterations on sub-keys be recursive
-                         (affects self.__iter__, and default for get_sub_key)
-        Usage examples:
-            k = RegKey("HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
-                is the same as:
-            k = RegKey("\SOFTWARE\Microsoft\Windows\CurrentVersion\Run", winreg.HKEY_LOCAL_MACHINE)
-        Note:
-            _winreg has been renamed winreg in Python3
-        """
-        # No HKEY_* given expect it in the path
-        # This way we support the string provided by Winreg's 'Copy Key Name'
+    :param str path: path to the key, may begin with one of the HKEY_* names
+        (see ``RegKey.HKEY_MAP``); in that case leave ``hkey`` as None.
+        A bare hive name (``"HKEY_CURRENT_USER"``) opens the hive root.
+    :param hkey: optional, one of ``RegKey.HKEY_MAP`` keys
+    :param bool deep: should iteration be recursive (affects ``__iter__`` and
+        the default for ``get_sub_key``)
+
+    Example::
+
+        RegKey(r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
+        RegKey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", winreg.HKEY_LOCAL_MACHINE)
+
+    Not re-entrant: a RegKey object can be used in one ``with`` block at a time.
+    """
+
+    HKEY_MAP = _hkey_map()
+    _NAME_TO_HKEY = {name: hkey for hkey, name in HKEY_MAP.items()}
+
+    def __init__(self, path: str, hkey: int | None = None, deep: bool = False) -> None:
+        # No hkey given: expect an HKEY_* name as the first path segment (this is
+        # the format produced by regedit's "Copy Key Name").
         if hkey is None:
-            split_path = path.split(os.path.sep)
-            self._hkey_name = split_path[0].upper()
-            path = os.path.join(*split_path[1:])
-            hkey = getattr(winreg, self._hkey_name, None)
-            if not isinstance(hkey, number_type):
-                raise UnknownHkeyException("Couldn't find HKEY name %s" % self._hkey_name)
+            first, _, rest = path.strip(_SEP).partition(_SEP)
+            self._hkey_name = first.upper()
+            hkey = self._NAME_TO_HKEY.get(self._hkey_name)
+            if hkey is None:
+                raise UnknownHkeyException(f"Couldn't find HKEY name {first}")
+            path = rest
         else:
-            self._hkey_name = self.HKEY_MAP[hkey]
-        self._path = path
+            try:
+                self._hkey_name = self.HKEY_MAP[hkey]
+            except (KeyError, TypeError):
+                raise UnknownHkeyException(f"Unknown hkey {hkey!r}") from None
+        self._path = path.strip(_SEP)
         self._hkey = hkey
-        self._key = None
+        self._key: Any = None
         self._deep = deep
 
     @property
-    def path(self):
+    def path(self) -> str:
+        """Path of the key under its hive."""
         return self._path
 
     @property
-    def name(self):
-        return os.path.split(self.path)[-1]
+    def name(self) -> str:
+        """Last segment of the key path (empty for a hive root)."""
+        return self._path.rsplit(_SEP, 1)[-1]
 
     @property
-    def hkey(self):
+    def hkey(self) -> int:
         return self._hkey
 
     @property
-    def hkey_name(self):
+    def hkey_name(self) -> str:
         return self._hkey_name
 
-    def __enter__(self):
-        """
-        Open the key for usage within the Context block
-        :return: self
-        """
-        try:
-            self._key = winreg.OpenKey(self._hkey, self._path)
-            return self
-        except WindowsError:
-            raise
+    def __enter__(self) -> RegKey:
+        """Open the key for use within the context block."""
+        if self._key is not None:
+            raise WinregalException(f"RegKey {self!r} is already open")
+        self._key = winreg.OpenKey(self._hkey, self._path)
+        return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        winreg.CloseKey(self._key)
-        self._key = None
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        key, self._key = self._key, None
+        if key is not None:
+            winreg.CloseKey(key)
 
-    def get_sub_key(self, sub_path, deep=None):
+    def _require_open(self) -> Any:
+        if self._key is None:
+            raise KeyNotOpenException()
+        return self._key
+
+    def get_sub_key(self, sub_path: str, deep: bool | None = None) -> RegKey:
+        """Return an (unopened) RegKey for ``sub_path`` relative to this key.
+
+        Leading/trailing backslashes in ``sub_path`` are ignored: the result is
+        always beneath this key.
+
+        :param deep: recursive iteration for the new key; defaults to this key's setting
         """
-        :param sub_path: path of the underlying sub-key to access
-        :param bool deep: should the opened key be set to recursive iterations. If omitted current keys setting is used
-        :return RegKey: The sought key
-        """
+        self._require_open()
         if deep is None:
             deep = self._deep
-        if self._key is None:
-            raise KeyNotOpenException()
-        path = os.path.join(self._path, sub_path)
-        return RegKey(path, self._hkey, deep=deep)
+        return RegKey(_join(self._path, sub_path), self._hkey, deep=deep)
 
-    def get_value(self, name):
-        """
-        :param str name: path of the sub value to access
-        :return RegValue: sought value
-        """
-        if self._key is None:
-            raise KeyNotOpenException()
-        data, data_type = winreg.QueryValueEx(self._key, name)
+    def get_value(self, name: str) -> RegValue:
+        """Return the value called ``name`` (raises OSError if missing)."""
+        data, data_type = winreg.QueryValueEx(self._require_open(), name)
         return RegValue(name, data, data_type)
 
-    def __getitem__(self, item):
-        """
-        Convenience wrapper over self.get_value() and self.get_sub_key()
-        :param item: the path to the sub item
-        :return RegKey, RegValue: the underlying sought key or value
+    def __getitem__(self, item: str) -> RegValue | RegKey:
+        """Return the value called ``item``, or if there is none, the sub-key.
+
+        Only a "not found" error falls back to the sub-key; any other error
+        (e.g. access denied) propagates.
         """
         try:
             return self.get_value(item)
         except KeyNotOpenException:
             raise
-        # No value by that name, let's try for a key
-        except WindowsError:
-            return self.get_sub_key(item)
+        except OSError as e:
+            if not _is_not_found(e):
+                raise
+        return self.get_sub_key(item)
 
-    def __repr__(self):
-        return "RegKey(%s\%s)" % (self.hkey_name, self.path)
+    def __repr__(self) -> str:
+        return f"RegKey({self.hkey_name}\\{self.path})"
 
-    def enum_keys(self):
-        """
-        Iterate over all keys under this key. Keys are yielded as partial path strings
-        :return: an Iterator
-        """
-        if self._key is None:
-            raise KeyNotOpenException()
+    def enum_keys(self) -> Iterator[str]:
+        """Yield the names of all sub-keys. Errors other than end-of-list propagate."""
+        key = self._require_open()
         i = 0
         while True:
             try:
-                yield winreg.EnumKey(self._key, i)
-                i += 1
-            except WindowsError:
-                return
+                name = winreg.EnumKey(key, i)
+            except OSError as e:
+                if getattr(e, "winerror", None) == ERROR_NO_MORE_ITEMS:
+                    return
+                raise
+            yield name
+            i += 1
 
-    def enum_values(self):
-        """
-        Iterate over all values under this key. Values are yielded as a tuple (name, data, data_type)
-        :return: an Iterator
-        """
-        if self._key is None:
-            raise KeyNotOpenException()
+    def enum_values(self) -> Iterator[tuple]:
+        """Yield ``(name, data, data_type)`` per value. Errors other than end-of-list propagate."""
+        key = self._require_open()
         i = 0
         while True:
             try:
-                yield winreg.EnumValue(self._key, i)
-                i += 1
-            except WindowsError:
-                return
+                item = winreg.EnumValue(key, i)
+            except OSError as e:
+                if getattr(e, "winerror", None) == ERROR_NO_MORE_ITEMS:
+                    return
+                raise
+            yield item
+            i += 1
 
-    def __iter__(self):
-        """
-        Iterate over all Keys and values under this Key
-        Recursive if deep is set to True
-        """
+    def __iter__(self) -> Iterator[RegValue | RegKey]:
+        """Iterate over values, then sub-keys (recursively if ``deep``)."""
         for value_tuple in self.enum_values():
             yield RegValue(*value_tuple)
         for key_path in self.enum_keys():
@@ -201,26 +231,26 @@ class RegKey(object):
             yield key
             if self._deep:
                 with key:
-                    for item in key:
-                        yield item
+                    yield from key
 
-    def to_dict(self, keep_type=False):
+    def to_dict(self, keep_type: bool = False, max_depth: int | None = None) -> dict[str, Any]:
+        """Recursively translate this key to a dict.
+
+        :param keep_type: store RegValue objects (with type) instead of bare data
+        :param max_depth: optional limit on sub-key nesting; deeper keys are omitted
+            (None, the default, means unlimited)
+
+        A value and a sub-key sharing a name collide; the sub-key wins.
         """
-        Recursively traverse registry keys and translate to a python dictionary
-        :param bool keep_type: should values be saved as a RegValue(including type) object,
-         or should only their data be saved, default is data only.
-        :return: a dict representing the registry key hierarchy
-        """
-        res = {}
+        res: dict[str, Any] = {}
         for value_tuple in self.enum_values():
             value = RegValue(*value_tuple)
-            if keep_type:
-                res[value.name] = value
-            else:
-                res[value.name] = value.data
+            res[value.name] = value if keep_type else value.data
+        if max_depth is not None and max_depth <= 0:
+            return res
+        next_depth = None if max_depth is None else max_depth - 1
         for key_path in self.enum_keys():
             key = self.get_sub_key(key_path, deep=False)
             with key:
-                res[key.name] = key.to_dict()
+                res[key_path] = key.to_dict(keep_type=keep_type, max_depth=next_depth)
         return res
-
